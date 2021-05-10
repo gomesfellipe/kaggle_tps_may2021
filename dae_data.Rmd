@@ -1,0 +1,289 @@
+---
+title: "Untitled"
+author: "Fellipe Gomes"
+date: "5/9/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)    # data science toolkit
+library(tidymodels)   # machine learning toolkit
+library(workflowsets) # optimize workflow (or Pipelines for python users)
+library(themis)       # resampling
+library(treesnip)
+library(stacks)
+library(keras)
+
+# options(repr.plot.width=12, repr.plot.height=4, warn = -1)
+theme_set(theme_bw())
+set.seed(1234)
+
+train <- read_csv("train.csv")
+test <- read_csv("test.csv")
+full <- bind_rows(train, test)
+```
+
+Distribuicao da target
+
+```{r}
+full %>% count(target) %>% mutate(prop = n/sum(n)*100)
+```
+
+# Auto encoder
+
+```{r}
+x_train <- 
+  full %>% 
+  select(-id, -target) %>% 
+  mutate_all(scale) %>% 
+  as.matrix()
+```
+
+```{r}
+# set model
+model <- keras_model_sequential()
+model %>%
+  layer_dense(units = 32, activation = "tanh", input_shape = ncol(x_train),
+              bias_regularizer = keras::regularizer_l1(0.001)) %>%
+  layer_dropout(0.6) %>%
+  layer_dense(units = 16, activation = "tanh", 
+              bias_regularizer = keras::regularizer_l1(0.001)) %>%
+  layer_dropout(0.6) %>%
+  layer_dense(units = 2, activation = "tanh", name = "bottleneck") %>%
+  layer_dense(units = 16, activation = "tanh", 
+              bias_regularizer = keras::regularizer_l1(0.001)) %>%
+  layer_dropout(0.6) %>%
+  layer_dense(units = 32, activation = "tanh", 
+              bias_regularizer = keras::regularizer_l1(0.001)) %>%
+  layer_dropout(0.6) %>%
+  layer_dense(units = ncol(x_train), activation = "linear")
+
+
+# view model layers
+summary(model)
+```
+
+```{r}
+# compile model
+model %>% compile(
+  loss = "mean_squared_error", 
+  optimizer = optimizer_rmsprop(
+    lr = 0.01,
+    rho = 0.9,
+    epsilon = NULL,
+    decay = 0,
+    clipnorm = NULL,
+    clipvalue = NULL
+  )
+)
+
+history <- model %>% fit(
+  x_train, x_train,
+  epochs = 30, 
+  batch_size = 128,
+  shuffle=TRUE,
+  view_metrics = TRUE,
+  validation_split = 0.2
+)
+
+plot(history)
+```
+
+```{r}
+# evaluate the performance of the model
+mse.ae2 <- evaluate(model, x_train, x_train)
+mse.ae2
+```
+
+```{r}
+intermediate_layer_model <- keras_model(inputs = model$input, outputs = get_layer(model, "bottleneck")$output)
+
+intermediate_output <- predict(intermediate_layer_model, x_train)
+
+ggplot(data.frame(PC1 = intermediate_output[,1],
+                  PC2 = intermediate_output[,2]),
+       aes(x = PC1, y = PC2, col = full$target)) + 
+  geom_point(alpha=.5)+
+  facet_wrap(~full$target)
+```
+
+
+# DAE
+
+```{r}
+# set model
+model <- keras_model_sequential()
+model %>%
+  layer_dense(units = 512, activation = "tanh", input_shape = ncol(x_train),
+              bias_regularizer = keras::regularizer_l1(0.01)) %>%
+  layer_dense(units = 256, activation = "tanh", 
+              bias_regularizer = keras::regularizer_l1(0.01)) %>%
+  layer_dense(units = 150, activation = "tanh", name = "bottleneck") %>%
+  layer_dense(units = 256, activation = "tanh", 
+              bias_regularizer = keras::regularizer_l1(0.01)) %>%
+  layer_dense(units = 512, activation = "tanh", 
+              bias_regularizer = keras::regularizer_l1(0.01)) %>%
+  layer_dense(units = ncol(x_train), activation = "linear")
+
+
+# view model layers
+summary(model)
+```
+
+```{r}
+# compile model
+model %>% compile(
+  loss = "mean_squared_error", 
+  optimizer = optimizer_rmsprop(
+    lr = 0.01,
+    rho = 0.9,
+    epsilon = NULL,
+    decay = 0,
+    clipnorm = NULL,
+    clipvalue = NULL
+  )
+)
+
+history <- model %>% fit(
+  x_train, x_train,
+  epochs = 30, 
+  batch_size = 128,
+  shuffle=TRUE,
+  view_metrics = TRUE,
+  validation_split = 0.2
+)
+
+plot(history)
+```
+
+```{r}
+# evaluate the performance of the model
+mse.ae2 <- evaluate(model, x_train, x_train)
+mse.ae2
+```
+
+```{r}
+intermediate_layer_model <- keras_model(inputs = model$input, outputs = get_layer(model, "bottleneck")$output)
+
+intermediate_output <- predict(intermediate_layer_model, x_train)
+dim(intermediate_output)
+
+daeta_full <- bind_cols(
+  full %>% select(id, target),
+  as_tibble(intermediate_output)
+)
+
+daeta_train <- daeta_full %>% filter(id %in% train$id)
+daeta_test <- daeta_full %>% filter(id %in% test$id)
+```
+
+# Model
+
+```{r}
+tps_folds <- train %>% rsample::vfold_cv(v = 4,repeats = 2, strata = target)
+
+base_tps_recipe <- recipe(target~., data=train) %>%
+  step_rm(id) %>%
+  step_zv(all_predictors())
+
+rec_filter <- 
+  base_tps_recipe %>% 
+  step_corr(all_numeric(), threshold = 0.5)
+
+lgb_spec <- 
+  boost_tree(
+    trees = 200,      # num_iterations
+    learn_rate = 0.3 ,  # eta
+    min_n = 20,        # min_data_in_leaf
+    #tree_depth = 6,   # max_depth
+    sample_size = 1,   # bagging_fraction
+    mtry = 1,          # feature_fraction
+    loss_reduction = 0 # min_gain_to_split
+  ) %>%  
+  set_engine("lightgbm", num_leaves = 31) %>% 
+  set_mode("classification")
+
+lgb_wflow_bas <- workflow() %>% 
+  add_recipe(rec_filter) %>% 
+  add_model(lgb_spec) 
+
+lgb_res_bas <- fit_resamples(
+  lgb_wflow_bas,
+  tps_folds,
+  metrics = metric_set(mn_log_loss),
+  control = control_resamples(save_pred = TRUE)
+)
+
+lgb_res_bas %>%
+  collect_metrics()
+
+lgb_res_bas_pred <- lgb_res_bas %>%
+  collect_predictions() %>%{
+    bind_cols(.,
+              select(., .pred_Class_1, .pred_Class_2, .pred_Class_3, .pred_Class_4) %>%
+                {tibble(.pred_class = apply(., 1, function(x){paste0("Class_", which(x==max(x)))}))})
+  }
+
+lgb_res_bas_pred %>%
+  select(.pred_class, target) %>%
+  table() %>%
+  conf_mat() %>%
+  autoplot(type = "heatmap")+
+  labs(title = "Confusion Matrix")
+```
+
+```{r}
+tps_folds <- daeta_train %>% rsample::vfold_cv(v = 4, repeats = 2, strata = target)
+
+base_tps_recipe <- recipe(target~., data=daeta_train) %>%
+  step_rm(id) %>%
+  step_zv(all_predictors())
+
+nnet_spec <- mlp(
+  hidden_units=5, 
+  penalty=0,	
+  dropout=0,
+  epochs=20, 
+  activation=	"softmax" 
+) %>%  
+  set_engine("keras",
+             shuffle=TRUE,
+             view_metrics = TRUE,
+             validation_split = 0.2
+             ) %>% 
+  set_mode("classification")
+
+nnet_wflow <- workflow() %>% 
+  add_recipe(base_tps_recipe) %>% 
+  add_model(nnet_spec) 
+
+nnet_res <- fit_resamples(
+  nnet_wflow,
+  tps_folds,
+  metrics = metric_set(mn_log_loss),
+  control = control_resamples(save_pred = TRUE)
+)
+
+nnet_res %>%
+  collect_metrics()
+
+nnet_res_pred <- nnet_res %>%
+  collect_predictions() %>%{
+    bind_cols(.,
+              select(., .pred_Class_1, .pred_Class_2, .pred_Class_3, .pred_Class_4) %>%
+                {tibble(.pred_class = apply(., 1, function(x){paste0("Class_", which(x==max(x)))}))})
+  }
+
+nnet_res_pred %>%
+  select(.pred_class, target) %>%
+  table() %>%
+  conf_mat() %>% 
+  autoplot(type = "heatmap")+
+  labs(title = "Confusion Matrix")
+```
+
+

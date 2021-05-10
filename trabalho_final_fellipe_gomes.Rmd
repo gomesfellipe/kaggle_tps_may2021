@@ -1,0 +1,208 @@
+---
+title: "Estudo sobre auto-encoders"
+author: "Fellipe Gomes"
+date: "5/7/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+```
+
+# Intro
+
+# Dados 
+
+```{r}
+
+```
+
+Correlação entre as features
+
+```{r, eval=F}
+train %>% 
+  select(-id, -target) %>% 
+  cor(method = 'spearman') %>% 
+  heatmaply::heatmaply_cor(
+    xlab = "Features",
+    ylab = "Features",
+    k_col = 4,
+    k_row = 8
+  )
+```
+
+# Redução de dimensionalidade
+
+## PCA
+
+```{r}
+library("FactoMineR")
+library("factoextra")
+res.pca <- 
+  train %>% 
+  select(-id, -target) %>%  
+  PCA(graph = FALSE, scale.unit = T)
+
+# get_eigenvalue(res.pca)
+fviz_eig(res.pca, addlabels = TRUE, ncp = 50)
+```
+
+
+
+## Auto-Encoder
+
+### Denoising Autoencoders
+
+A ideia básica de um DAE é aprender como o conjunto de dados é construído. Você faz isso adicionando ruído aos seus dados e, em seguida, tenta diminuir o ruído da entrada para que o modelo emita dados limpos.
+
+Se isso for feito da maneira certa, os pesos do seu modelo conterão todas as informações sobre os recursos e suas interações (não há mais necessidade de engenharia de recursos, mas a maior caixa preta que você pode obter!).
+
+#### Bottleneck
+
+```{r}
+library(keras)
+
+normalize <- function(x, na.rm = TRUE) {
+    return((x- min(x)) /(max(x)-min(x)))
+}
+
+# set training data
+x_train <- 
+  train %>% 
+  select(-id, -target) %>% 
+  mutate_all(normalize) %>% 
+  as.matrix()
+
+# set model
+model <- keras_model_sequential()
+model %>%
+  layer_dense(units = 500, activation = "tanh", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 500, activation = "tanh") %>%
+  layer_dense(units = 250, activation = "tanh", name = "bottleneck") %>%
+  layer_dense(units = 500, activation = "tanh") %>%
+  layer_dense(units = 500, activation = "tanh") %>%
+  layer_dense(units = ncol(x_train), activation = "linear")
+
+# view model layers
+summary(model)
+
+# compile model
+model %>% compile(
+  loss = "mean_squared_error", 
+  optimizer = "adam"
+)
+
+history <- model %>% fit(
+  x_train, x_train,
+  epochs = 50, #batch_size = 128,
+  view_metrics = TRUE,
+  validation_split = 0.2
+)
+
+plot(history)
+# evaluate the performance of the model
+mse.ae2 <- evaluate(model, x_train, x_train)
+mse.ae2
+
+intermediate_layer_model <- keras_model(inputs = model$input, outputs = get_layer(model, "bottleneck")$output)
+
+intermediate_output <- predict(intermediate_layer_model, x_train)
+
+ggplot(data.frame(PC1 = intermediate_output[,1],
+                  PC2 = intermediate_output[,2]),
+       aes(x = PC1, y = PC2, col = train$target)) + 
+  geom_point(alpha=.5)
+
+train_dae <- predict(model, x_train)
+train_dae %>% as_tibble()
+```
+
+
+
+
+
+
+Autoencoder é uma NN não supervisionada que "aprende" como codificar os dados com eficiência compactando e reconstruindo os dados de volta a partir de uma representação codificada para para que seja o mais proximo possível da entrada original.
+
+Portanto o autoencoder reduz a dimensão dos dados, aprendendo como ignorar o ruído.
+
+4 Componentes do Autoencoder:
+
+1. **Codificador**: Aprende a reduzir as dimensões comprimindo os dados de entrada para uma representao codificada.
+2- **Gargalo** : é a camada que contém a representação compactada dos dados de entrada. Esta é a menor dimensão possível dos dados de entrada.
+3- **Decodificador** : no qual o modelo aprende como reconstruir os dados a partir da representação codificada para ficar o mais próximo possível da entrada original.
+4- **Perda de Reconstrução** : Este é o método que mede o desempenho do decodificador e a proximidade da saída com a entrada original.
+
+O treino envolve *back propagation* para minimizar a função de perda de reconstrução da rede.
+
+1- Autoencoder para detecção de anomalias:
+
+No entanto, se você tiver dados de entrada correlacionados, o método autoencoder funcionará muito bem porque a operação de codificação depende dos recursos correlacionados para compactar os dados.
+
+Digamos que treinamos um codificador automático no conjunto de dados MNIST. Usando uma rede neural FeedForward simples, podemos conseguir isso construindo uma rede simples de 6 camadas como abaixo:
+
+Ver: <https://gist.githubusercontent.com/wmlba/ed6448da9dce3a3c0f6ee78e972dd07b/raw/602bb3c79fc4b17334c9d9ba7488e91fbb86b83e/autoencoder_feedforward.py>
+
+Como você pode ver na saída, a última perda / erro de reconstrução para o conjunto de validação é 0,0193, o que é ótimo. Agora, se eu passar qualquer imagem normal do conjunto de dados MNIST, a perda de reconstrução será muito baixa (<0,02) MAS se eu tentar passar qualquer outra imagem diferente (outlier ou anomalia), obteremos um alto valor de perda de reconstrução porque o rede falhou em reconstruir a imagem / entrada que é considerada uma anomalia.
+
+Observe no código acima, você pode usar apenas a parte do codificador para compactar alguns dados ou imagens e também pode usar apenas a parte do decodificador para descompactar os dados carregando as camadas do decodificador.
+
+Agora, vamos fazer uma detecção de anomalias. O código a seguir usa duas imagens diferentes para prever a pontuação da anomalia (erro de reconstrução) usando a rede autoencoder que treinamos acima. a primeira imagem é do MNIST e o resultado é 5,43209. Isso significa que a imagem não é uma anomalia. A segunda imagem que usei é uma imagem completamente aleatória que não pertence ao conjunto de dados de treinamento e os resultados foram: 6789,4907. Este erro alto significa que a imagem é uma anomalia. O mesmo conceito se aplica a qualquer tipo de conjunto de dados.
+
+Ver: <https://gist.githubusercontent.com/wmlba/8a5a8996a14c41e8a1e2de98ca6bfffb/raw/3fbb0a29b596ed45a27e2dcfc9a0ea3f533237ad/predict_anomaly.autoencoder.py>
+
+2- Denoising de imagem:
+
+Denoising ou redução de ruído é o processo de remoção de ruído de um sinal. Pode ser uma imagem, áudio ou documento. Você pode treinar uma rede Autoencoder para aprender como remover o ruído das imagens. Para experimentar este caso de uso, vamos reutilizar o famoso conjunto de dados MNIST e criar algum ruído sintético no conjunto de dados. O código a seguir simplesmente adicionará algum ruído ao conjunto de dados e, em seguida, representará algumas imagens para garantir que as tenhamos criado com sucesso.
+
+Ver: <https://gist.github.com/wmlba/e01f8a77b98d8836cd6a8c612bbaf389/raw/2aa19a576a3d2804af2898c7f3bb5d39bac3c541/noise_images.py>
+
+Neste exemplo, vamos construir uma rede neural autencoder convolucional. Vou percorrer cada linha de construção da rede:
+
+Primeiro, definimos a camada de entrada e as dimensões dos dados de entrada. O conjunto de dados MNIST tem imagens que foram remodeladas para ter dimensões de 28 x 28. Como as imagens são em escala de cinza, o canal de cor da imagem será 1, então a forma é (28, 28, 1).
+
+A segunda camada é a camada de convolução, esta camada cria um kernel de convolução que é convolvido com a entrada da camada para produzir um tensor de saídas. 32 é o número de filtros de saída na convolução e (3, 3) é o tamanho do kernel.
+
+Após cada camada de convolução, usamos a função MaxPooling para reduzir as dimensões. O (28, 28, 32) é reduzido por um fator de dois, então será (14, 14, 32) após o primeiro MaxPooling e (7, 7, 32) após o segundo MaxPooling. Esta é a representação codificada da imagem.
+
+```
+input_img = Input(shape=(28, 28, 1))
+
+nn = Conv2D(32, (3, 3), activation='relu', padding='same')(input_img)
+nn = MaxPooling2D((2, 2), padding='same')(nn)
+nn = Conv2D(32, (3, 3), activation='relu', padding='same')(nn)
+encoded = MaxPooling2D((2, 2), padding='same')(nn)
+```
+
+O código abaixo é a parte de reconstrução dos dígitos originais. É aqui que a rede realmente aprende como remover o ruído das imagens de entrada. Usamos a função UpSampling para reconstruir as imagens para as dimensões originais (28, 28)
+
+```
+nn = Conv2D(32, (3, 3), activation='relu', padding='same')(encoded)
+nn = UpSampling2D((2, 2))(nn)
+nn = Conv2D(32, (3, 3), activation='relu', padding='same')(nn)
+nn = UpSampling2D((2, 2))(nn)
+decoded = Conv2D(1, (3, 3), activation='sigmoid', padding='same')(nn)
+```
+
+Agora, a última etapa restante é criar o modelo, compilá-lo e iniciar o treinamento. Fazemos isso executando:
+
+``` 
+autoencoder = Model(input_img, decoded)  
+autoencoder.compile(optimizer='adadelta',loss='binary_crossentropy')
+autoencoder.fit(x_train_noisy, x_train,
+epochs=50,
+batch_size=256,
+validation_data=(x_test_noisy, x_test))
+```
+
+
+Referencias: 
+
+- <https://towardsdatascience.com/auto-encoder-what-is-it-and-what-is-it-used-for-part-1-3e5c6f017726>
+- <http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/112-pca-principal-component-analysis-essentials/>
+- <https://www.researchgate.net/post/What-is-the-need-of-auto-encoder-when-we-already-have-powerful-dimension-reduction-techniques-such-as-PCA>
+- <https://www.quora.com/How-is-autoencoder-compared-with-other-dimensionality-reduction-algorithms>
+- <https://www.kaggle.com/c/porto-seguro-safe-driver-prediction/discussion/44629>
+- <https://www.kaggle.com/springmanndaniel/1st-place-turn-your-data-into-daeta>
