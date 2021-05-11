@@ -206,3 +206,5 @@ Referencias:
 - <https://www.quora.com/How-is-autoencoder-compared-with-other-dimensionality-reduction-algorithms>
 - <https://www.kaggle.com/c/porto-seguro-safe-driver-prediction/discussion/44629>
 - <https://www.kaggle.com/springmanndaniel/1st-place-turn-your-data-into-daeta>
+
+- <https://towardsdatascience.com/how-to-apply-self-supervision-to-tabular-data-introducing-dfencoder-eec21c4afaef>
