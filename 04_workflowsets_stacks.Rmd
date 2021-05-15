@@ -1,0 +1,158 @@
+---
+title: "Untitled"
+author: "Fellipe Gomes"
+date: "5/9/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)    # data science toolkit
+library(tidymodels)   # machine learning toolkit
+library(workflowsets) # optimize workflow (or Pipelines for python users)
+library(themis)       # resampling
+
+options(repr.plot.width=12, repr.plot.height=4, warn = -1)
+
+theme_set(theme_bw())
+
+set.seed(1234)
+
+# remotes::install_github("curso-r/treesnip", dependencies = FALSE)
+library(treesnip)
+
+# install.packages("stacks")
+library(stacks)
+
+train <- read_csv("train.csv")
+test <- read_csv("test.csv")
+```
+
+```{r}
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE) 
+registerDoParallel(cores = all_cores) 
+```
+
+```{r}
+tps_folds <- train %>% rsample::vfold_cv(v = 4,repeats = 2, strata = target)
+
+base_tps_recipe <- recipe(target~., data=train) %>%
+    step_rm(id) %>%
+    step_zv(all_predictors())
+
+rec_filter <- 
+  base_tps_recipe %>% 
+  step_corr(all_numeric(), threshold = tune())
+
+rec_normalize <- 
+  base_tps_recipe %>% 
+  step_normalize(all_numeric())
+
+rec_pca <- 
+  base_tps_recipe %>% 
+  step_normalize(all_numeric()) %>%
+  step_pca(all_numeric(), num_comp = tune())
+
+rec_smote <- 
+  base_tps_recipe %>% 
+  step_smote(all_outcomes())
+```
+
+```{r}
+regularized_spec <- 
+  multinom_reg(mode = "classification", penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet", parallel=TRUE)
+
+lgb_spec <- 
+  boost_tree(
+    trees = tune(),      # num_iterations
+    learn_rate = tune() ,  # eta
+    min_n = 20,        # min_data_in_leaf
+    #tree_depth = 6,   # max_depth
+    sample_size = 1,   # bagging_fraction
+    mtry = 1,          # feature_fraction
+    loss_reduction = 0 # min_gain_to_split
+  ) %>%  
+  set_engine("lightgbm", num_leaves = 31) %>% 
+  set_mode("classification")
+
+nnet_spec <- mlp(
+  hidden_units = tune(),
+  penalty = tune(),
+  epochs = tune()
+) %>%  
+  set_engine("nnet") %>% 
+  set_mode("classification")
+```
+
+```{r}
+chi_models <- 
+   workflow_set(
+      preproc = list(filter = rec_filter,
+                     pca = rec_pca,
+                     smote = rec_smote,
+                     normalize = rec_normalize
+                    ),
+      models = list(glmnet = regularized_spec,
+                    lgb = lgb_spec,
+                    nnet = nnet_spec
+                   ),
+      cross = TRUE
+   )
+
+#chi_models$wflow_id
+chi_models <- 
+   chi_models %>% 
+   anti_join(tibble(wflow_id = c("filter_nnet",
+                                 "smote_glmnet",
+                                 "smote_nnet"
+                                )), 
+             by = "wflow_id")
+```
+
+```{r}
+set.seed(123)
+chi_models <- 
+   chi_models %>% 
+    workflow_map("tune_grid", 
+                 resamples = tps_folds, 
+                 grid = 1,
+                 save_pred = TRUE, 
+                 metrics = metric_set(mn_log_loss),
+                 control = control_stack_grid(), # control_stack_bayes
+                 verbose = TRUE)
+```
+
+```{r}
+autoplot(chi_models)
+autoplot(chi_models, select_best = TRUE)
+```
+
+```{r}
+(workflow_best_results <- rank_results(chi_models, rank_metric = "mn_log_loss", select_best = TRUE) %>% 
+   select(rank, mean, model, wflow_id, .config))
+```
+
+```{r}
+m1 <- chi_models$result[[which(chi_models$wflow_id==workflow_best_results$wflow_id[1])]]
+m2 <- chi_models$result[[which(chi_models$wflow_id==workflow_best_results$wflow_id[2])]]
+m3 <- chi_models$result[[which(chi_models$wflow_id==workflow_best_results$wflow_id[3])]]
+
+tps_data_st <- 
+  stacks() %>%
+  add_candidates(m1) %>%
+  add_candidates(m2) %>%
+  add_candidates(m3)
+
+tps_model_st <-
+  tps_data_st %>%
+  blend_predictions()
+
+autoplot(tps_model_st)
+```
+
+

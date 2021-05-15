@@ -1,0 +1,143 @@
+---
+title: ''
+author: "Fellipe Gomes"
+date: "5/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidymodels)
+library(stacks)
+library(treesnip)
+
+theme_set(theme_bw())
+
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE) 
+registerDoParallel(cores = all_cores) 
+```
+
+
+```{r}
+train <- readr::read_csv("train.csv")
+test <- readr::read_csv("test.csv")
+```
+
+
+```{r}
+tps_folds <- train %>% rsample::vfold_cv(v = 4, strata = target)
+
+base_tps_recipe <- 
+  recipe(target~., data=train) %>%
+  step_rm(id) %>%
+  # step_zv(all_predictors()) %>%
+  # step_corr(all_predictors()) %>% 
+  step_normalize(all_numeric())
+
+# Redes neurais
+
+nnet_spec <- mlp() %>%  
+  set_engine("nnet") %>% 
+  set_mode("classification")
+
+nnet_wflow <- workflow() %>% 
+  add_recipe(base_tps_recipe) %>% 
+  add_model(nnet_spec) 
+
+tictoc::tic()
+nnet_res <- fit_resamples(
+  nnet_wflow,
+  tps_folds,
+  metrics = metric_set(mn_log_loss),
+  control = control_stack_resamples()
+)
+tictoc::toc()
+
+collect_metrics(nnet_res)
+
+# XGBoost
+
+xgb_spec <- boost_tree() %>%  
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_wflow <- workflow() %>% 
+  add_recipe(base_tps_recipe) %>% 
+  add_model(xgb_spec) 
+
+tictoc::tic()
+xgb_res <- fit_resamples(
+  xgb_wflow,
+  tps_folds,
+  metrics = metric_set(mn_log_loss),
+  control = control_stack_resamples()
+)
+tictoc::toc()
+
+collect_metrics(xgb_res)
+
+# GLM
+
+glm_spec <- 
+  multinom_reg(mixture = tune(), penalty = tune()) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification")
+
+glm_wflow <- workflow() %>% 
+  add_recipe(base_tps_recipe) %>% 
+  add_model(glm_spec) 
+
+glm_grid <- expand.grid(mixture = 0:1, penalty = 0) # 10^seq(-3, 2, length.out = 8)
+
+tictoc::tic()
+glm_res <- tune_grid(
+  glm_wflow,
+  resamples = tps_folds,
+  grid = glm_grid,
+  metrics = metric_set(mn_log_loss, accuracy),
+  control = control_stack_grid()
+)
+tictoc::toc()
+
+show_best(glm_res, metric = 'mn_log_loss')
+
+# Stacks
+
+tps_data_st <- 
+  stacks() %>%
+  add_candidates(nnet_res, "nnet") %>%
+  add_candidates(xgb_res, "xgb") %>%
+  add_candidates(glm_res, "glm")
+
+tps_model_st <-
+  tps_data_st %>%
+  blend_predictions(metric = metric_set(mn_log_loss))
+
+gc()
+
+autoplot(tps_model_st)
+
+autoplot(tps_model_st, type = "weights")
+
+tps_model_st <-
+  tps_model_st %>%
+  fit_members()
+
+nnet_fit <- fit(nnet_wflow, train) 
+
+
+glm_wflow_final <- finalize_workflow(glm_wflow,
+                  select_best(glm_res, metric = 'mn_log_loss'))
+
+glm_fit <- fit(glm_wflow_final, train)
+
+sub_nnet <- predict(nnet_wflow, type="prob")
+sub_glm <- predict(glm_wflow, type="prob")
+sub_xgb <- predict(xgb_wflow, type="prob")
+
+sub_pred <- predict(tps_model_st, ., type = "prob")
+
+```
+
