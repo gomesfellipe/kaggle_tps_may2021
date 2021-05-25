@@ -1,0 +1,390 @@
+---
+title: "Traalho Final"
+author: "Fellipe Gomes"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F, error = F, fig.width = 10)
+
+library(tidyverse)
+library(keras)
+
+theme_set(theme_bw())
+
+normalize <- function(x, na.rm = TRUE) {
+  return((x- min(x)) /(max(x)-min(x)))
+}
+
+as_metrics_df = function(history) {
+  
+  # create metrics data frame
+  df <- as.data.frame(history$metrics)
+  
+  # pad to epochs if necessary
+  pad <- history$params$epochs - nrow(df)
+  pad_data <- list()
+  for (metric in history$params$metrics)
+    pad_data[[metric]] <- rep_len(NA, pad)
+  df <- rbind(df, pad_data)
+  
+  # return df
+  df
+}
+```
+
+# Intro
+
+# Dados 
+
+```{r}
+full <- readr::read_csv("train.csv")
+
+set.seed(314)
+test <- 
+  full %>% 
+  group_by(target) %>% 
+  sample_frac(0.2) %>% 
+  ungroup()
+
+train <- full %>% filter(!id %in% test$id) 
+```
+
+# Redução de dimensionalidade
+
+Técnicas de redução de dimensionalidade serão aplicadas a fim de entender de maneira visual como os dados estão distribuidos. 
+
+```{r}
+set.seed(314)
+to_pca <- 
+  train %>% 
+  group_by(target) %>% 
+  sample_frac(.1) %>% 
+  ungroup()
+```
+
+## Correlação
+
+```{r}
+to_pca %>% 
+  select(-id, -target) %>% 
+  cor(method = 'spearman') %>% 
+  heatmaply::heatmaply_cor(
+    xlab = "Features",
+    ylab = "Features",
+    k_col = 4,
+    k_row = 8
+  )
+```
+
+A correlação é inexistente entre as features deste dataset, o que inviabiliza o uso de alguns recursos de redução de dimensionalidade 
+
+## PCA
+
+```{r}
+res.pca <- 
+  to_pca %>% 
+  select(-id, -target) %>%  
+  FactoMineR::PCA(graph = FALSE, scale.unit = T)
+
+# get_eigenvalue(res.pca)
+factoextra::fviz_eig(res.pca, addlabels = TRUE, ncp = 50)
+```
+
+## t-SNE - **t**-Distributed **S**tochastic **N**eighbor **E**mbedding
+
+Este algoritmo é uma ótima ferramenta para ajudar na compreensão de dados de alta dimensionalidade porém não é tão útil para aplicar a redução de dimensionalidade para treinamento de modelos de *machine learning*
+
+```{r, eval = F}
+tsne_tps <- to_pca %>% 
+  select(-id, -target) %>% 
+  Rtsne::Rtsne(dims=2, perplexity=30, 
+               PCA=FALSE,
+               verbose=T, max_iter=500, 
+               check_duplicates = FALSE)
+saveRDS(tsne_tps, "tsne_tps.rds")
+```
+
+
+```{r}
+tsne_tps <- readRDS("tsne_tps.rds")
+
+as_tibble(tsne_tps$Y) %>% 
+  bind_cols(select(to_pca, target)) %>% 
+  ggplot(aes(x=V1, y=V2, col=target))+
+  geom_point()+
+  labs(title = "t-SNE")
+```
+
+## UMAP - **U**niform **M**anifold **A**pproximation and **P**rojection
+
+```{r, eval = F}
+umap_tps <- umap::umap(select(to_tsne, -id, -target))
+saveRDS(umap_tps, "umap_tps.rds")
+```
+
+
+```{r}
+umap_tps <- readRDS("umap_tps.rds")
+
+# predict(umap_tps, select(test, -id, -target))
+as_tibble(umap_tps$layout) %>% 
+  bind_cols(select(train, target)) %>% 
+  ggplot(aes(x=V1, y=V2, col=target))+
+  geom_point()+
+  labs(title = "UMAP")
+```
+
+# Redes Neurais 
+
+```{r}
+batch_size <- 128
+epochs <- 500
+```
+
+
+## AE - **A**uto**E**ncoder
+
+```{r}
+x_train <- 
+  full %>% 
+  select(-id, -target) %>% 
+  mutate_all(scale) %>% 
+  as.matrix()
+
+model <- keras_model_sequential()
+
+model %>%
+  layer_dense(units = 564, activation = "relu", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_dense(units = 2, activation = "tanh", name = "bottleneck") %>%
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_dense(units = 564, activation = "relu") %>%
+  layer_dense(units = ncol(x_train), activation = "linear")
+
+summary(model)
+
+model %>% compile(
+  metrics = c("accuracy"),
+  loss = "mean_squared_error", 
+  optimizer = optimizer_adam(
+    lr = 0.001 ))
+```
+
+
+```{r, eval = T}
+tictoc::tic()
+history <- model %>%
+  fit(x = x_train, y = x_train, 
+      epochs = epochs,
+      validation_split =.2,
+      view_metrics = TRUE, 
+      callbacks=list(callback_early_stopping(
+        monitor = "val_loss",
+        min_delta = 0.01,
+        patience = 50,
+        restore_best_weights = TRUE
+      )),
+      verbose=2)
+tictoc::toc()
+
+model %>% save_model_tf("model_ae")
+saveRDS(history, "history_ae.rds")
+```
+
+```{r}
+model <- load_model_tf("model_ae")
+history <- readRDS("history_ae.rds")
+history
+```
+
+```{r}
+# gap = epochs - nrow(as_metrics_df(history))
+# gap_tbl = tibble(loss= rep(NA_real_, gap),
+#                  accuracy= rep(NA_real_, gap),
+#                  val_loss= rep(NA_real_, gap),
+#                  val_accuracy= rep(NA_real_, gap)
+# )
+
+# bind_rows(as_metrics_df(history), gap_tbl ) %>% 
+as_metrics_df(history) %>%
+  mutate(epochs = 1:nrow(.)) %>% 
+  gather(key, val, -epochs) %>% 
+  mutate(metric = case_when(
+    str_detect(key, "accuracy") ~ "accuracy",
+    str_detect(key, "loss") ~ "log_loss" )) %>% 
+  ggplot(aes(x = epochs, y = val, col=key)) +
+  geom_point()+
+  geom_smooth(se = F)+
+  theme_bw()+
+  facet_wrap(~metric, scales = "free_y")
+
+```
+
+```{r}
+# evaluate the performance of the model
+mse.ae2 <- evaluate(model, x_train, x_train)
+mse.ae2
+```
+
+
+```{r}
+intermediate_layer_model <- keras_model(inputs = model$input, outputs = get_layer(model, "bottleneck")$output)
+intermediate_output <- predict(intermediate_layer_model, x_train)
+
+ggplot(data.frame(PC1 = intermediate_output[,1],
+                  PC2 = intermediate_output[,2]),
+       aes(x = PC1, y = PC2, col = full$target)) + 
+  geom_point(alpha=.5)
+
+# train_dae <- predict(model, x_train)
+# train_dae %>% as_tibble()
+```
+
+
+## DAE - **D**enoise **A**uto**E**ncoder
+
+```{r}
+samples <- sample(1:2, size = nrow(full), replace = T, prob = c(0.8, 0.2))
+
+# set training data
+x_train <- 
+  full %>% 
+  filter(samples==1)  %>% 
+  select(-id, -target) %>% 
+  mutate_all(scale) %>% 
+  as.matrix()
+
+x_val <- 
+  full %>% 
+  filter(samples==2)  %>% 
+  select(-id, -target) %>% 
+  mutate_all(scale) %>% 
+  as.matrix()
+```
+
+```{r}
+model <- keras_model_sequential()
+
+model %>%
+  layer_dense(units = 564, activation = "relu", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_dense(units = 2, activation = "tanh", name = "bottleneck") %>%
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_dense(units = 564, activation = "relu") %>%
+  layer_dense(units = ncol(x_train), activation = "linear")
+
+summary(model)
+
+model %>% compile(
+  metrics = c("accuracy"),
+  loss = "mean_squared_error", 
+  optimizer = optimizer_adam(
+    lr = 0.001 ))
+```
+
+```{r}
+batch_generator <- function(data, batch_size, perc=.35)
+{
+  function() {
+    
+    data_original <- data
+    ids <- sample(1:nrow(data), batch_size, replace = FALSE)
+    
+    tryCatch({
+      
+      for(j in 1:ncol(data)){
+        to_shuffle <- sample(c(T, F), size = nrow(data[ids, ]), replace = T, prob = c(perc, 1-perc))
+        data[ids,][which(to_shuffle), j] <- sample(data[ids,][which(to_shuffle), j])
+      }
+      
+    }, error=function(e){
+      print("Deu merda no shuffle!")
+      data = data
+    })
+    
+    list(
+      as.matrix(data[ids, ]),
+      as.matrix(data_original[ids, ])
+    )
+  }
+}
+
+steps_per_epoch <- 600 #floor(nrow(x_train)/batch_size)
+validation_steps <- 100 #floor(nrow(x_val)/batch_size)
+```
+
+```{r, eval = T}
+tictoc::tic()
+history <- model %>%
+  fit(batch_generator(x_train, batch_size),
+      steps_per_epoch = steps_per_epoch,
+      validation_steps = validation_steps,
+      validation_data = batch_generator(x_val, batch_size),
+      epochs = epochs, 
+      view_metrics = TRUE, 
+      callbacks=list(callback_early_stopping(
+        monitor = "val_loss",
+        min_delta = 0.01,
+        patience = 50,
+        restore_best_weights = TRUE
+      )), 
+      verbose=2)
+tictoc::toc()
+
+model %>% save_model_tf("model_dae")
+saveRDS(history, "history_dae.rds") 
+```
+
+```{r}
+model <- load_model_tf("model_ae")
+history <- readRDS("history_dae.rds") 
+history
+```
+
+
+```{r}
+as_metrics_df(history) %>% 
+  mutate(epochs = 1:nrow(.)) %>% 
+  gather(key, val, -epochs) %>% 
+  mutate(metric = case_when(
+    str_detect(key, "accuracy") ~ "accuracy",
+    str_detect(key, "loss") ~ "log_loss" )) %>% 
+  ggplot(aes(x = epochs, y = val, col=key)) +
+  geom_point()+
+  geom_smooth(se = F)+
+  theme_bw()+
+  facet_wrap(~metric, scales = "free_y")
+```
+
+
+```{r}
+# evaluate the performance of the model
+mse.ae2 <- evaluate(model, x_train, x_train)
+mse.ae2
+```
+
+
+```{r}
+intermediate_layer_model <- keras_model(inputs = model$input, outputs = get_layer(model, "bottleneck")$output)
+intermediate_output <- predict(intermediate_layer_model, x_train)
+
+ggplot(data.frame(PC1 = intermediate_output[,1],
+                  PC2 = intermediate_output[,2]),
+       aes(x = PC1, y = PC2, col = full$target)) + 
+  geom_point(alpha=.5)
+
+# train_dae <- predict(model, x_train)
+# train_dae %>% as_tibble()
+```
+
+
+
+
+
+
+
+
